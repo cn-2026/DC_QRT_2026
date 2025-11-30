@@ -1,0 +1,266 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+from sklearn.model_selection import train_test_split
+
+from sksurv.ensemble import GradientBoostingSurvivalAnalysis
+from sksurv.util import Surv
+from sksurv.metrics import concordance_index_ipcw
+
+
+# ==============================================================================
+# 1. FEATURE ENGINEERING 
+# ==============================================================================
+
+def process_data(clinical_df, molecular_df):
+    """
+    
+    - Poids par type d'effet
+    - IMPACT_SCORE = VAF * WEIGHT
+    - Pivot gènes -> IMPACT_SCORE
+    - Méta-scores : TOTAL_RISK_LOAD, MAX_VAF, NB_MUTATIONS
+    - Dummies sur toutes les variables catégorielles
+    """
+    # Poids standards (ceux que tu utilisais)
+    effect_weights = {
+        'Frameshift': 3.0,
+        'Nonsense': 3.0,
+        'Splice_Site': 2.0,
+        'Missense': 1.0,
+        'In_Frame_Del': 1.0,
+        'Silent': 0.1,
+        'Synonymous': 0.1
+    }
+
+    mol = molecular_df.copy()
+    mol['WEIGHT'] = mol['EFFECT'].map(effect_weights).fillna(1.0)
+    mol['IMPACT_SCORE'] = mol['VAF'] * mol['WEIGHT']
+
+    # Pivot : IMPACT_SCORE par gène
+    mol_pivot = mol.pivot_table(
+        index='ID',
+        columns='GENE',
+        values='IMPACT_SCORE',
+        aggfunc='sum',
+        fill_value=0.0
+    )
+
+    # Méta-scores par patient
+    meta = mol.groupby('ID').agg(
+        TOTAL_RISK_LOAD=('IMPACT_SCORE', 'sum'),
+        MAX_VAF=('VAF', 'max'),
+        NB_MUTATIONS=('GENE', 'count'),
+    )
+    mol_pivot = mol_pivot.join(meta, how="left").fillna(0.0)
+
+    # Clinique
+    clin = clinical_df.copy()
+    clin.columns = [c.upper() for c in clin.columns]
+
+    # Merge clinique + moléculaire
+    X = clin.merge(mol_pivot, how="left", on="ID").fillna(0.0)
+    X = X.set_index("ID")
+
+    # Dummies sur toutes les catégorielles (CENTER, CYTOGENETICS, etc.)
+    X = pd.get_dummies(X, drop_first=True, dtype=float)
+
+    # Nettoyage 
+    X = X.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    return X
+
+
+# ==============================================================================
+# 2. CHARGEMENT TRAIN & TEST
+# ==============================================================================
+
+def find_train_path(cwd: Path) -> Path:
+    path_train = None
+    for p in [cwd] + list(cwd.parents):
+        candidate = p / "data" / "raw" / "train"
+        if candidate.is_dir():
+            path_train = candidate
+            break
+    if path_train is None:
+        path_train = cwd
+    return path_train
+
+
+def find_test_path(cwd: Path) -> Path:
+    
+    path_test = None
+    for p in [cwd] + list(cwd.parents):
+        if (p / "X_test").is_dir():
+            path_test = p / "X_test"
+            break
+        if (p / "data" / "raw" / "X_test").is_dir():
+            path_test = p / "data" / "raw" / "X_test"
+            break
+    if path_test is None:
+        path_test = cwd / "X_test"
+    return path_test
+
+
+# ==============================================================================
+# 3. MAIN : TRAIN + SCORE + EXTRACTION TEST
+# ==============================================================================
+
+if __name__ == "__main__":
+
+    # ------------------------ A. CHARGEMENT ------------------------
+
+    cwd = Path.cwd()
+    path_train = find_train_path(cwd)
+    path_test = find_test_path(cwd)
+
+    print(f"   Dossier train = {path_train}")
+    print(f"   Dossier test  = {path_test}")
+
+    clinical_train = pd.read_csv(path_train / "clinical_train.csv")
+    molecular_train = pd.read_csv(path_train / "molecular_train.csv")
+    target_train = pd.read_csv(path_train / "target_train.csv")
+
+    clinical_test = pd.read_csv(path_test / "clinical_test.csv")
+    molecular_test = pd.read_csv(path_test / "molecular_test.csv")
+
+    # Target train
+    target_train.columns = ["ID", "OS_YEARS", "OS_STATUS"]
+    target_clean = target_train.dropna(subset=["OS_YEARS", "OS_STATUS"])
+
+    # ------------------------ B. FEATURE ENGINEERING ------------------------
+    print(">>> FEATURE ENGINEERING (process_data)...")
+
+    X_train_raw = process_data(clinical_train, molecular_train)
+    X_test_raw = process_data(clinical_test, molecular_test)
+
+    print(f"   X_train_raw shape = {X_train_raw.shape}")
+    print(f"   X_test_raw  shape = {X_test_raw.shape}")
+
+    # Alignement IDs avec la target
+    common_ids = X_train_raw.index.intersection(target_clean["ID"])
+    X_train_raw = X_train_raw.loc[common_ids].copy()
+    y_df = target_clean.set_index("ID").loc[common_ids]
+
+    y = Surv.from_arrays(
+        event=y_df["OS_STATUS"].astype(bool),
+        time=y_df["OS_YEARS"].astype(float)
+    )
+
+    print(f"   Données alignées : {X_train_raw.shape[0]} patients.")
+
+    # ------------------------ C. SPLIT 80/20 POUR SCORE ------------------------
+    print(">>> 3. EXAMEN BLANC (split 80/20 sur le TRAIN)...")
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_raw, y,
+        test_size=0.2,
+        random_state=42,
+        stratify=y["event"]
+    )
+
+    print(f"   Train : {X_train.shape}, Val : {X_val.shape}")
+
+    # ------------------------ D. ENTRAÎNEMENT (SCORE) ------------------------
+    print(">>> 4. ENTRAÎNEMENT DU MODÈLE (Gradient Boosting 3000) POUR SCORE...")
+
+    gb_val = GradientBoostingSurvivalAnalysis(
+        n_estimators=3000,
+        learning_rate=0.01,
+        max_depth=5,
+        min_samples_leaf=15,
+        max_features="sqrt",
+        random_state=42,
+        verbose=1
+    )
+
+    gb_val.fit(X_train, y_train)
+
+    print(">>> 5. CALCUL DU SCORE SUR LE 20% VAL...")
+    preds_val = gb_val.predict(X_val)
+
+    tau = y_train["time"].max()
+    score_val = concordance_index_ipcw(y_train, y_val, preds_val, tau=tau)[0]
+
+    print("\n" + "=" * 60)
+    print(f"ESTIMATION FIABLE DE TON SCORE (20% val) :")
+    print(f"IPCW C-index : {score_val:.4f}")
+    print("=" * 60)
+
+    # ------------------------ E. RÉ-ENTRAÎNEMENT SUR 100% DU TRAIN ------------------------
+    print("\n>>> 6. RÉ-ENTRAÎNEMENT SUR 100% DU TRAIN POUR LA SOUMISSION...")
+
+    gb_full = GradientBoostingSurvivalAnalysis(
+        n_estimators=3000,
+        learning_rate=0.01,
+        max_depth=5,
+        min_samples_leaf=15,
+        max_features="sqrt",
+        random_state=42,
+        verbose=0
+    )
+
+    gb_full.fit(X_train_raw, y)
+    print("   Modèle entraîné sur l'ensemble du train.")
+
+    # ------------------------ F. PRÉPARATION DU TEST ------------------------
+    print("\n>>> 7. PRÉPARATION DU TEST (alignement des colonnes)...")
+
+    # On aligne les colonnes du test sur celles du train
+    X_test_final = X_test_raw.reindex(columns=X_train_raw.columns, fill_value=0.0)
+
+    print(f"   X_test_final shape = {X_test_final.shape}")
+
+    # ------------------------ G. PRÉDICTION SUR LE TEST ------------------------
+    print("\n>>> 8. PRÉDICTIONS SUR LE TEST...")
+
+    preds_test = gb_full.predict(X_test_final)
+
+    # Optionnel : normalisation (invariante au rang, ne change pas le C-index)
+    def normalize(x):
+        x = np.asarray(x, dtype=float)
+        return (x - x.mean()) / (x.std() + 1e-8)
+
+    risk_scores = normalize(preds_test)
+
+    # ------------------------ H. FICHIER DE SOUMISSION BRUT ------------------------
+    print("\n>>> 9. CRÉATION DU FICHIER DE SOUMISSION (BRUT)...")
+
+    submission_raw = pd.DataFrame({
+        "ID": X_test_final.index,
+        "risk_score": risk_scores
+    })
+
+    raw_filename = "submission_GB_baseline_raw.csv"
+    submission_raw.to_csv(raw_filename, index=False)
+    print(f"   -> Fichier brut sauvegardé : {raw_filename}")
+
+    # ------------------------ I. CORRECTION DE FORMAT------------------------
+    print("\n>>> 10. CORRECTION DU FORMAT...")
+
+    path_random_sub = None
+    for p in [cwd] + list(cwd.parents):
+        results = list(p.glob("**/random_submission*.csv"))
+        if results:
+            path_random_sub = results[0]
+            break
+
+    if path_random_sub is not None:
+        print(f"   Template trouvé : {path_random_sub}")
+        template = pd.read_csv(path_random_sub)
+
+        #  prédictions dans un Series indexé par ID du test
+        my_preds = pd.Series(risk_scores, index=X_test_final.index)
+
+        # 'risk_score' du template en mappant les IDs
+        template["risk_score"] = template["ID"].map(my_preds).fillna(0.0)
+
+        clean_filename = "submission_GB_baseline_CLEAN.csv"
+        template.to_csv(clean_filename, index=False)
+        print(f"   -> Fichier propre généré : {clean_filename}")
+        print("   (Même format/ordre que le random_submission)")
+    else:
+        print("   Aucun template random_submission*.csv trouvé.")
+        print("   On utilise le fichier brut tel quel.")
+
+    print("\n>>> TERMINÉ.")
